@@ -71,7 +71,7 @@ model.predict(dummy_frame, device='cuda', verbose=False)
 last_seen = time.time()
 
 # ip camera stream
-url = 'http://192.168.137.24:8080/video'
+url = 'http://192.168.1.72:8080/video'
 vs = VideoStream(url).start()
 
 cv2.namedWindow("Vampire Power", cv2.WINDOW_NORMAL)
