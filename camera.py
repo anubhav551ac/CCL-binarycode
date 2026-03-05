@@ -2,15 +2,17 @@ import cv2
 import numpy as np
 from ultralytics import YOLOWorld
 import threading
+from datetime import datetime
+import time
 
 class VideoStream:
     def __init__(self, src):
-        self.cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG) #cap = capture(frame)
-        
+        self.cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)  # cap = capture(frame)
+
         if not self.cap.isOpened():
             print("Cannot connect to camera")
-            exit() 
-            
+            exit()
+
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.ret, self.frame = self.cap.read()
         self.stopped = False
@@ -33,47 +35,55 @@ class VideoStream:
 
     def stop(self):
         self.stopped = True
-        self.cap.release() #let the frame fly into the vast void of the world of network
+        self.cap.release()  # let the frame fly into the vast void of the world of network
 
-def determine_state(roi, ambient_brightness): #roi = region of interest
+
+def determine_state(roi, ambient_brightness):  # roi = region of interest
     if roi is None or roi.size == 0: return False, 0, 0
-    
+
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     avg_brightness = np.mean(gray)
     contrast = np.std(gray)
-    
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV) #hsv = hue saturation value
-    avg_saturation = np.mean(hsv[:,:,1])
 
-    #calibration
-    is_bright = avg_brightness > (ambient_brightness * 1.25) #increase if in brighter
-    is_vibrant = avg_saturation > 45 #increase if others colorful
-    is_high_contrast = contrast > 40 #increase if screen has reflection
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)  # hsv = hue saturation value
+    avg_saturation = np.mean(hsv[:, :, 1])
+
+    # calibration
+    is_bright = avg_brightness > (ambient_brightness * 1.25)  # increase if in brighter
+    is_vibrant = avg_saturation > 45  # increase if others colorful
+    is_high_contrast = contrast > 40  # increase if screen has reflection
 
     score = sum([is_bright, is_vibrant, is_high_contrast])
-    print(f"Obj: {label} | Bright: {int(avg_brightness)} | Contrast: {int(contrast)}") #remove later
+    # print(f"Obj: {label} | Bright: {int(avg_brightness)} | Contrast: {int(contrast)}")  # remove later
     return score >= 2, avg_brightness, contrast
 
 model = YOLOWorld('yolov8s-world.pt').to('cuda')
 custom_classes = ["person", "laptop", "monitor", "television", "desk lamp",
-                "computer mouse", "keyboard", "power strip", "electric fan",
-                "air conditioner", "cell phone", "printer", "open window",
-                "wall light", "tablet"] #the objects
+                  "computer mouse", "keyboard", "power strip", "electric fan",
+                  "air conditioner", "cell phone", "printer", "open window",
+                  "wall light", "tablet"]  # the objects
+nonelectronic_class = ["person", "open window"]
 model.set_classes(custom_classes)
 
-#initialise
+# initialise
 dummy_frame = np.zeros((1280, 720, 3), dtype=np.uint8)
 model.predict(dummy_frame, device='cuda', verbose=False)
+last_seen = time.time()
 
-#ip camera stream
-url = 'http://192.168.137.250:8080/video'
+# ip camera stream
+url = 'http://192.168.137.24:8080/video'
 vs = VideoStream(url).start()
 
 cv2.namedWindow("Vampire Power", cv2.WINDOW_NORMAL)
+count_frame = 0
 
 while True:
     frame = vs.read()
     if frame is None: continue
+
+    count_frame += 1
+    if count_frame % 60 != 0:
+        continue
 
     frame = cv2.resize(frame, (1280, 720))
     temp_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -96,9 +106,10 @@ while True:
             if label == "person":
                 person_present = True
                 cv2.rectangle(frame, (coords[0], coords[1]), (coords[2], coords[3]), (0, 255, 0), 2)
+                last_seen = time.time()
                 continue
 
-            roi = frame[coords[1]:coords[3], coords[0]:coords[2]] #for non person objects
+            roi = frame[coords[1]:coords[3], coords[0]:coords[2]]  # for non person objects
             is_on, _, _ = determine_state(roi, ambient_brightness)
 
             if is_on:
@@ -109,6 +120,8 @@ while True:
                 status_tag = "ON"
             else:
                 status_tag = "OFF"
+            if label in nonelectronic_class:
+                status_tag = "_"
 
             cv2.rectangle(frame, (coords[0], coords[1]), (coords[2], coords[3]), color, 2)
             cv2.putText(frame, f"{label} {status_tag}", (coords[0], coords[1] - 10),
@@ -122,15 +135,15 @@ while True:
 
     if energy_waste_detected and not person_present:
         alert_color = (0, 0, 255)
-        final_msg = "!! ALERT: UNATTENDED WASTE !!"
+        final_msg = f"UNATTENDED WASTE FOR {time.time() - last_seen:.1f}s"
     elif person_present:
         final_msg = "OCCUPIED - ENERGY AUTHORIZED"
 
-    cv2.rectangle(frame, (0,0), (1280, 60), (0,0,0), -1)
+    cv2.rectangle(frame, (0, 0), (1280, 60), (0, 0, 0), -1)
     cv2.putText(frame, final_msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, alert_color, 3)
 
     cv2.imshow("Vampire Power", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'): 
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 vs.stop()
