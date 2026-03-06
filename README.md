@@ -1,5 +1,5 @@
 # CCL-binarycode
-Real time energy waste detection using computer vision\
+Real time energy waste detection using computer vision
 # The problem 
 Standby energy, also known as "vampire power" is when electronic devices use up energy without being used.\
 This costs the world $19 billion annually.\
