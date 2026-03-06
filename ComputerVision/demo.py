@@ -344,12 +344,22 @@ with tab_live:
               <div style="font-size:13px;color:{TEAL};">Model loading, please wait...</div>
             </div>""", unsafe_allow_html=True)
         else:
+            # Use JS to build the feed URL from the page's own hostname/IP,
+            # so remote clients (phones, etc.) resolve to the server, not localhost.
             st.markdown(f"""
-            <div style="border-radius:12px;overflow:hidden;background:#000;line-height:0;">
-              <img src="http://localhost:{MJPEG_PORT}/feed"
+            <div id="feedwrap" style="border-radius:12px;overflow:hidden;background:#000;line-height:0;min-height:200px;">
+              <img id="ghostfeed" src=""
                    style="width:100%;border-radius:12px;display:block;"
-                   onerror="this.style.display='none'">
-            </div>""", unsafe_allow_html=True)
+                   onerror="this.style.opacity='0.3'">
+            </div>
+            <script>
+              (function(){{
+                var img = document.getElementById('ghostfeed');
+                if(img){{
+                  img.src = window.location.protocol + '//' + window.location.hostname + ':{MJPEG_PORT}/feed';
+                }}
+              }})();
+            </script>""", unsafe_allow_html=True)
 
         if detections:
             ref   = get_ref_table()

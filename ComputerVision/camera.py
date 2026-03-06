@@ -16,7 +16,7 @@ from datetime import datetime, date
 from flask import Flask, Response
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-CAMERA_IP   = os.environ.get("GHOSTGRID_CAM_IP",        "192.168.1.72")
+CAMERA_IP   = os.environ.get("GHOSTGRID_CAM_IP",        "192.168.137.244")
 CAMERA_PORT = os.environ.get("GHOSTGRID_CAM_PORT",       "8080")
 CAMERA_URL  = f"http://{CAMERA_IP}:{CAMERA_PORT}/video"
 PTZ_URL     = f"http://{CAMERA_IP}:{CAMERA_PORT}/ptz"
@@ -31,7 +31,12 @@ CUSTOM_CLASSES = [
     "wall light", "flat rectangular tablet with white edges", "hand",
 ]
 NONELECTRONIC = {"person", "open window", "hand"}
-GRACE_PERIOD  = 5.0
+GRACE_PERIOD       = 5.0
+# Minimum consecutive frames a detection must persist before it's treated as real.
+# At ~10 FPS this is ~0.5s. Eliminates single-frame YOLO misfire ghosts.
+MIN_CONFIRM_FRAMES = 5
+# Frames a detection can be missing before it's considered gone (avoids flickering out)
+MAX_MISSING_FRAMES = 3
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -232,6 +237,10 @@ class CameraProcessor:
         self._last_loop_t    = time.time()
         self._fps_counter    = 0
         self._fps_timer      = time.time()
+
+        # Flicker filter: track consecutive-seen and consecutive-missing frame counts
+        # per unique_key.  Format: {unique_key: {"seen": int, "missing": int, "confirmed": bool}}
+        self._presence        = {}
 
         # tracks whether person was present last frame (edge detection)
         self._person_was_present = False
@@ -469,6 +478,24 @@ class CameraProcessor:
                 # We collapse track IDs here so we show ONE entry per device type
                 live_detections = {}   # keyed by label prefix
 
+                # ── presence / flicker filter ──────────────────────────────
+                seen_keys = {uk for uk, _, _ in filtered}
+                for uk in list(self._presence.keys()):
+                    if uk not in seen_keys:
+                        self._presence[uk]["missing"] += 1
+                        self._presence[uk]["seen"]     = 0
+                        if self._presence[uk]["missing"] > MAX_MISSING_FRAMES:
+                            del self._presence[uk]   # truly gone
+
+                for unique_key, label, coords in filtered:
+                    p = self._presence.setdefault(unique_key,
+                                                  {"seen": 0, "missing": 0, "confirmed": False})
+                    p["seen"]    += 1
+                    p["missing"]  = 0
+                    if p["seen"] >= MIN_CONFIRM_FRAMES:
+                        p["confirmed"] = True
+                # ───────────────────────────────────────────────────────────────
+
                 for unique_key, label, coords in filtered:
                     if label in NONELECTRONIC:
                         cv2.rectangle(frame,
@@ -476,6 +503,10 @@ class CameraProcessor:
                                       (255, 255, 255), 1)
                         cv2.putText(frame, label, (coords[0], coords[1] - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        continue
+
+                    # skip ghost detections that haven't confirmed yet
+                    if not self._presence.get(unique_key, {}).get("confirmed", False):
                         continue
 
                     roi    = frame[coords[1]:coords[3], coords[0]:coords[2]]
