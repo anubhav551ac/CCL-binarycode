@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from ultralytics import YOLOWorld, YOLOE
+from ultralytics import YOLOWorld
 import threading
 import time
 import requests
@@ -91,7 +91,7 @@ def determine_state(roi, ambient_brightness):  # roi = region of interest
     # print(f"Obj: {label} | Bright: {int(avg_brightness)} | Contrast: {int(contrast)}")  # remove later
     return score >= 2, avg_brightness, contrast
 
-model = YOLOE('yoloe-26s-seg.pt').to('cuda')
+model = YOLOWorld('yolov8s-world.pt').to('cuda')
 custom_classes = ["person", "laptop", "monitor", "television", "desk lamp",
                   "computer mouse", "keyboard", "power strip", "electric fan",
                   "air conditioner", "cell phone", "printer", "open window",
@@ -144,6 +144,7 @@ device_timers = {}
 grace_period = 5.0
 total_waste = {}
 last_loop_time = time.time()
+total_usage = {}
 
 # ip camera stream
 url = 'http://192.168.137.244:8080/video'
@@ -162,10 +163,10 @@ while True:
     if key == ord('q'):
         break
     elif key in [ord('='), ord('r')]:
-        current_zoom = min(current_zoom + 10, 100);
+        current_zoom = min(current_zoom + 10, 100)
         set_zoom(current_zoom)
     elif key == ord('e'):
-        current_zoom = max(current_zoom - 10, 0);
+        current_zoom = max(current_zoom - 10, 0)
         set_zoom(current_zoom)
 
     frame = cv2.resize(frame, (1920, 1080))
@@ -223,12 +224,11 @@ while True:
 
             if is_on:
                 if being_used:
+                    total_usage[unique_key] = total_usage.get(unique_key, 0) + delta_time
                     device_timers[unique_key] = current_time
                     color, status_tag = (0, 255, 0), "IN USE"
                 else:
-                    # Increment total waste for this unique device
                     total_waste[unique_key] = total_waste.get(unique_key, 0) + delta_time
-
                     last_active = device_timers.get(unique_key, current_time)
                     time_unattended = current_time - last_active
 
@@ -246,20 +246,30 @@ while True:
     last_annotated_frame = frame
     cv2.imshow("Vampire Power", frame)
 
-print("\n--- FINAL ENERGY WASTE REPORT ---")
+print("\n--- FINAL ENERGY & EFFICIENCY REPORT ---")
 session_date = time.ctime()
-for dev_id, total_sec in total_waste.items():
-    if total_sec >= 5.0:
+for dev_id in set(list(total_waste.keys()) + list(total_usage.keys())):
+    t_waste = total_waste.get(dev_id, 0)
+    t_usage = total_usage.get(dev_id, 0)
+    
+    if (t_waste + t_usage) >= 2.0: # Only log if seen for more than 2 seconds
         label = dev_id.split('_')[0] if '_' in dev_id else dev_id
         cursor.execute('SELECT power_watts FROM devices WHERE device_type = ?', (label,))
         row = cursor.fetchone()
+        
         if row:
             power = row[0]
-            total_energy = power * (round(total_sec) / 3600)
-            carbon = total_energy * 0.0004
-            cursor.execute('INSERT INTO waste_logs (device_id, total_time_wasted, date, total_energy_wasted, carbon_footprint) VALUES (?, ?, ?, ?, ?)',
-                           (dev_id, total_sec, session_date, total_energy, carbon))
-            print(f"Device: {dev_id} | Total Waste: {total_sec:.1f} seconds | Energy Wasted: {total_energy:.2f} Wh | Carbon Footprint: {carbon:.4f} kg CO2")
+            # Calculate waste energy based on the waste timer
+            total_energy_wasted = power * (round(t_waste) / 3600)
+            carbon = total_energy_wasted * 0.0004
+            
+            cursor.execute('''INSERT INTO waste_logs 
+                              (device_id, total_time_wasted, total_time_used, date, total_energy_wasted, carbon_footprint) 
+                              VALUES (?, ?, ?, ?, ?, ?)''',
+                           (dev_id, t_waste, t_usage, session_date, total_energy_wasted, carbon))
+            
+            efficiency = (t_usage / (t_usage + t_waste)) * 100 if (t_usage + t_waste) > 0 else 0
+            print(f"Device: {dev_id:15} | Used: {t_usage:5.1f}s | Wasted: {t_waste:5.1f}s | Efficiency: {efficiency:.1f}%")
 
 conn.commit()
 conn.close()
