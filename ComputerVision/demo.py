@@ -1,24 +1,26 @@
-# ghostgrid — live dashboard
-# connects to: camera.py (shared frame file) + energy_data.db
+"""
+demo.py — GhostGrid dashboard
+Run with:  streamlit run demo.py
+camera.py must be in the same directory.
+"""
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-import sqlite3
 import time
 import os
-import numpy as np
-import cv2
+import atexit
 from datetime import datetime
 
-# ── CONFIG ──────────────────────────────────────────────────────────────────
-DB_PATH        = os.environ.get("GHOSTGRID_DB", "energy_data.db")
-FRAME_PATH     = os.environ.get("GHOSTGRID_FRAME", "ghostgrid_frame.jpg")   # camera.py writes here
-REFRESH_SECS   = 2
-COST_PER_KWH   = 15.0   # Rs per kWh (Nepal estimate)
-CARBON_INTENSITY = 490  # gCO2 per kWh (Nepal grid)
-# ────────────────────────────────────────────────────────────────────────────
+# ── import camera module directly ────────────────────────────────────────────
+from camera import CameraProcessor, init_db, DB_PATH
+
+# ── CONFIG ───────────────────────────────────────────────────────────────────
+REFRESH_SECS     = 2
+COST_PER_KWH     = 15.0    # Rs per kWh (Nepal)
+CARBON_INTENSITY = 490     # gCO2 per kWh (Nepal grid)
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="GhostGrid",
@@ -27,7 +29,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# ── THEME ───────────────────────────────────────────────────────────────────
+# ── THEME ─────────────────────────────────────────────────────────────────────
 NAVY     = "#2F4156"
 TEAL     = "#567C8D"
 SKY      = "#C8D9E6"
@@ -56,6 +58,7 @@ st.markdown(f"""
   .status_pill {{ padding:5px 16px; border-radius:20px; font-size:12px; font-weight:600; letter-spacing:0.5px; }}
   .pill_occupied {{ background:rgba(86,124,141,0.3); color:{SKY}; border:1px solid {TEAL}; }}
   .pill_empty    {{ background:rgba(192,57,43,0.2);  color:#F1948A;  border:1px solid {RED}; }}
+  .pill_loading  {{ background:rgba(200,200,200,0.3); color:#aaa; border:1px solid #ccc; }}
 
   .page_body {{ padding: 28px 36px; }}
 
@@ -73,7 +76,7 @@ st.markdown(f"""
   }}
 
   .alert_box_safe  {{ background:{WHITE};    border:1.5px solid {TEAL}; border-radius:12px; padding:22px; }}
-  .alert_box_waste {{ background:{RED_SOFT}; border:2px   solid {RED};  border-radius:12px; padding:22px; animation:pulsered 1.2s infinite; }}
+  .alert_box_waste {{ background:{RED_SOFT}; border:2px solid {RED};    border-radius:12px; padding:22px; animation:pulsered 1.2s infinite; }}
   @keyframes pulsered {{
     0%,100% {{ box-shadow:0 0 0 0 rgba(192,57,43,0.3); }}
     50%      {{ box-shadow:0 0 0 8px rgba(192,57,43,0); }}
@@ -90,7 +93,6 @@ st.markdown(f"""
   }}
   .stButton > button:hover {{ background:{TEAL} !important; }}
 
-  /* sortable log table */
   .log_table {{ width:100%; border-collapse:collapse; font-size:12px; background:{WHITE}; border-radius:12px; overflow:hidden; box-shadow:0 2px 12px rgba(47,65,86,0.07); }}
   .log_table th {{
     background:{NAVY}; color:{WHITE}; padding:11px 16px;
@@ -98,112 +100,90 @@ st.markdown(f"""
     cursor:pointer; user-select:none; white-space:nowrap;
   }}
   .log_table th:hover {{ background:{TEAL}; }}
-  .log_table th .sort_arrow {{ margin-left:4px; opacity:0.6; }}
-  .log_table th.active_sort .sort_arrow {{ opacity:1; }}
   .log_table td {{ padding:10px 16px; border-bottom:1px solid {SKY}; color:{NAVY}; }}
   .log_table tr:last-child td {{ border-bottom:none; }}
   .log_table tr:hover td {{ background:{BEIGE}; }}
   .td-device {{ background:{SKY}; color:{NAVY}; padding:2px 8px; border-radius:4px; font-size:10px; font-weight:600; letter-spacing:0.5px; }}
   .td-red    {{ color:{RED}; font-weight:600; }}
 
+  .detect_chip {{
+    display:inline-block; padding:3px 10px; border-radius:20px;
+    font-size:10px; font-weight:600; margin:2px; letter-spacing:0.3px;
+  }}
+  .chip_in_use  {{ background:#d4efdf; color:#1e8449; }}
+  .chip_wasting {{ background:{RED_SOFT}; color:{RED}; }}
+  .chip_off     {{ background:#eee; color:#888; }}
+
   .camera_box {{
     background:{SKY}; border-radius:12px; border:2px solid {SKY};
-    aspect-ratio:4/3; display:flex; flex-direction:column;
-    align-items:center; justify-content:center; gap:10px; position:relative; overflow:hidden;
-  }}
-  .camera_box_waste {{ background:#f0dada; border-color:{RED}; }}
-  .camera_badge {{
-    position:absolute; top:12px; left:12px;
-    background:rgba(47,65,86,0.8); color:{SKY};
-    font-size:10px; font-weight:600; padding:4px 10px; border-radius:20px; letter-spacing:1px;
-  }}
-  .detect_box_green {{
-    border:2px solid #27AE60; background:rgba(39,174,96,0.08);
-    padding:8px 20px; border-radius:6px; font-size:11px; color:#27AE60; font-weight:600;
-  }}
-  .detect_box_red {{
-    border:2px solid {RED}; background:rgba(192,57,43,0.08);
-    padding:8px 20px; border-radius:6px; font-size:11px; color:{RED}; font-weight:600;
-    animation:pulsered 1.2s infinite;
-  }}
-  .detect_item {{
-    display:inline-block; background:{SKY}; color:{NAVY};
-    padding:3px 10px; border-radius:20px; font-size:10px; font-weight:600; margin:2px;
-  }}
-  .detect_item_waste {{
-    background:#fadbd8; color:{RED};
+    aspect-ratio:16/9; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:12px;
   }}
 
   .empty_state {{ text-align:center; padding:32px; color:{TEAL}; font-size:13px; background:{WHITE}; border-radius:12px; border:1px dashed {SKY}; }}
   .row_divider {{ height:1px; background:{SKY}; margin:28px 0; }}
-  .toast_msg   {{ background:{TEAL}; color:{WHITE}; padding:12px 20px; border-radius:8px; font-size:13px; font-weight:500; text-align:center; margin-top:8px; }}
   [data-testid="column"] {{ padding: 0 8px !important; }}
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── SESSION STATE ────────────────────────────────────────────────────────────
-def _init(key, val):
-    if key not in st.session_state:
-        st.session_state[key] = val
+# ═══════════════════════════════════════════════════════════════════════════
+#  SPIN UP CAMERA PROCESSOR ONCE (cached for the lifetime of the server)
+# ═══════════════════════════════════════════════════════════════════════════
 
-_init("sort_col",   "date")
-_init("sort_asc",   False)
-_init("tab",        "live")
-
-
-# ── DB HELPERS ───────────────────────────────────────────────────────────────
 @st.cache_resource
-def get_conn():
-    # check-same-thread=False so streamlit can reuse across reruns
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+def get_processor():
+    db  = init_db()
+    cpu = CameraProcessor(db)
+    cpu.start()
+
+    # flush DB on server shutdown
+    def _on_exit():
+        cpu.stop()
+        cpu.flush_to_db()
+        db.close()
+    atexit.register(_on_exit)
+
+    return cpu
+
+processor = get_processor()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DB QUERY HELPERS  (use same connection from processor)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def query(sql, params=()):
     try:
-        conn = get_conn()
-        return pd.read_sql_query(sql, conn, params=params)
+        return pd.read_sql_query(sql, processor.db_conn, params=params)
     except Exception:
         return pd.DataFrame()
 
 def device_lookup(raw: str) -> str:
-    """Strip trailing _NNN and look up display name."""
     prefix = raw.rsplit('_', 1)[0] if '_' in raw else raw
     df = query("SELECT display_name FROM DeviceReferenceTable WHERE raw_prefix = ?", (prefix,))
-    if not df.empty:
-        return df.iloc[0, 0]
-    # fallback: title-case the raw prefix
-    return prefix.replace('_', ' ').title()
+    return df.iloc[0, 0] if not df.empty else prefix.replace('_', ' ').title()
 
-
-# ── LOAD DB STATS ────────────────────────────────────────────────────────────
 def load_totals():
     df = query("SELECT total_energy_wasted, carbon_footprint FROM waste_logs")
     if df.empty:
         return 0.0, 0.0, 0.0
-    total_energy = df["total_energy_wasted"].sum()           # Wh
-    total_carbon = df["carbon_footprint"].sum() * 1000       # g  (stored as kg)
-    total_cost   = (total_energy / 1000) * COST_PER_KWH     # Rs
+    total_energy = df["total_energy_wasted"].sum()
+    total_carbon = df["carbon_footprint"].sum() * 1000
+    total_cost   = (total_energy / 1000) * COST_PER_KWH
     return total_energy, total_carbon, total_cost
 
 def load_log() -> pd.DataFrame:
     df = query("""
-        SELECT
-            id,
-            date             AS raw_date,
-            device_id,
-            total_time_wasted,
-            total_energy_wasted,
-            carbon_footprint
-        FROM waste_logs
-        ORDER BY id DESC
+        SELECT id, date AS raw_date, device_id,
+               total_time_wasted, total_energy_wasted, carbon_footprint
+        FROM waste_logs ORDER BY id DESC
     """)
     if df.empty:
         return df
 
-    # parse date → separate Date and Time columns
     def split_dt(s):
         try:
-            # ctime format: "Mon Jan  1 00:00:00 2025"
             dt = datetime.strptime(s.strip(), "%a %b %d %H:%M:%S %Y")
             return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S"), dt
         except Exception:
@@ -214,68 +194,57 @@ def load_log() -> pd.DataFrame:
     df["Time"] = parsed.apply(lambda x: x[1])
     df["_dt"]  = parsed.apply(lambda x: x[2])
 
-    df["Device"]       = df["device_id"].apply(device_lookup)
-    df["Wasted (s)"]   = df["total_time_wasted"].round(1)
-    df["Energy (Wh)"]  = df["total_energy_wasted"].round(4)
-    df["Carbon (g)"]   = (df["carbon_footprint"] * 1000).round(4)
-    df["Cost (Rs)"]    = ((df["total_energy_wasted"] / 1000) * COST_PER_KWH).round(4)
+    df["Device"]      = df["device_id"].apply(device_lookup)
+    df["Wasted (s)"]  = df["total_time_wasted"].round(1)
+    df["Energy (Wh)"] = df["total_energy_wasted"].round(4)
+    df["Carbon (g)"]  = (df["carbon_footprint"] * 1000).round(4)
+    df["Cost (Rs)"]   = ((df["total_energy_wasted"] / 1000) * COST_PER_KWH).round(4)
 
     return df[["Date","Time","Device","Wasted (s)","Energy (Wh)","Carbon (g)","Cost (Rs)","_dt"]]
 
 
-# ── LIVE CAMERA FRAME ─────────────────────────────────────────────────────
-def read_frame():
-    """Return latest annotated frame as numpy array, or None."""
-    if not os.path.exists(FRAME_PATH):
-        return None
-    try:
-        img = cv2.imread(FRAME_PATH)
-        if img is not None:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    except Exception:
-        pass
-    return None
+# ═══════════════════════════════════════════════════════════════════════════
+#  SESSION STATE
+# ═══════════════════════════════════════════════════════════════════════════
 
-def parse_detections_from_frame(frame_rgb):
-    """
-    Very lightweight heuristic: look for green/red/grey bounding-box colours
-    drawn by camera.py and return rough labels.
-    This is a best-effort visual parser — camera.py is the authoritative source.
-    Returns: person_present (bool), wasting_devices (list), in_use_devices (list)
-    """
-    if frame_rgb is None:
-        return False, [], []
-    # convert to BGR for colour checks
-    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-
-    # pure green mask (person / in-use)  H~60  in OpenCV (0-180 scale)
-    green_mask = cv2.inRange(hsv, (55, 180, 180), (65, 255, 255))
-    # pure red mask (wasting)
-    red_mask1  = cv2.inRange(hsv, (0,  150, 150), (5,  255, 255))
-    red_mask2  = cv2.inRange(hsv, (175,150, 150), (180,255, 255))
-    red_mask   = red_mask1 | red_mask2
-
-    person_present = cv2.countNonZero(green_mask) > 500
-    wasting        = cv2.countNonZero(red_mask)   > 200
-    return person_present, wasting, []
+if "sort_col" not in st.session_state: st.session_state.sort_col = "Date"
+if "sort_asc" not in st.session_state: st.session_state.sort_asc = False
 
 
-# ── HEADER ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  READ LIVE STATE FROM PROCESSOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+with processor._lock:
+    cam_running     = processor.state["running"]
+    person_present  = processor.state["person_present"]
+    waste_active    = processor.state["waste_active"]
+    detections      = list(processor.state["detections"])
+    total_waste_now = dict(processor.state["total_waste"])
+    fps             = processor.state["fps"]
+    raw_frame       = processor.latest_frame   # BGR ndarray or None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HEADER
+# ═══════════════════════════════════════════════════════════════════════════
+
 total_energy, total_carbon, total_cost = load_totals()
-log_df = load_log()
 
-# Detect live state for pill
-frame_rgb = read_frame()
-person_present, waste_active, _ = parse_detections_from_frame(frame_rgb)
-room_label = "🟢 OCCUPIED" if person_present else ("🔴 WASTING" if waste_active else "⚪ EMPTY")
-pill_class = "pill_occupied" if person_present else "pill_empty"
+if not cam_running:
+    room_label, pill_class = "⏳ LOADING", "pill_loading"
+elif person_present:
+    room_label, pill_class = "🟢 OCCUPIED", "pill_occupied"
+elif waste_active:
+    room_label, pill_class = "🔴 WASTING", "pill_empty"
+else:
+    room_label, pill_class = "⚪ EMPTY", "pill_empty"
 
 st.markdown(f"""
 <div class="top_banner">
   <div class="brand_logo">👻 Ghost<span>Grid</span></div>
   <div class="banner_right">
-    <div class="live_time">⏰ {datetime.now().strftime("%H:%M:%S")}</div>
+    <div class="live_time">⏰ {datetime.now().strftime("%H:%M:%S")}  &nbsp;|&nbsp;  {fps} FPS</div>
     <div class="status_pill {pill_class}">{room_label}</div>
   </div>
 </div>
@@ -283,16 +252,18 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# ── TABS ──────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  TABS
+# ═══════════════════════════════════════════════════════════════════════════
+
 tab_live, tab_history, tab_graphs = st.tabs(["📷  Live Monitor", "📋  Incident Log", "📊  Analytics"])
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ───────────────────────────────────────────────────────────────────────────
 # TAB 1 — LIVE MONITOR
-# ══════════════════════════════════════════════════════════════════════════════
+# ───────────────────────────────────────────────────────────────────────────
 with tab_live:
 
-    # metric cards
     st.markdown('<div class="section_title">Session Totals (All-time from DB)</div>', unsafe_allow_html=True)
     m1, m2, m3 = st.columns(3)
     with m1:
@@ -315,49 +286,62 @@ with tab_live:
         </div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-
     col_feed, col_right = st.columns([6, 4], gap="large")
 
     with col_feed:
         st.markdown('<div class="section_title">📷 Live Sentinel Feed</div>', unsafe_allow_html=True)
 
-        if frame_rgb is not None:
-            # Show real camera frame with annotations from camera.py
-            st.image(frame_rgb, use_container_width=True,
-                     caption=f"Last frame — {datetime.now().strftime('%H:%M:%S')}")
-
-            # overlay badge via HTML (appears below the image in streamlit)
-            if person_present:
-                st.markdown('<div class="detect_box_green">✅ PERSON DETECTED — Monitoring</div>',
-                            unsafe_allow_html=True)
-            elif waste_active:
-                st.markdown('<div class="detect_box_red">⚠ DEVICE ON — ROOM EMPTY — Vampire Power!</div>',
-                            unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div style="color:{TEAL};font-size:12px;margin-top:4px;">Room empty — no active waste</div>',
-                            unsafe_allow_html=True)
-        else:
-            # camera.py not running / frame not yet written
+        MJPEG_PORT = int(os.environ.get("GHOSTGRID_MJPEG_PORT", "5050"))
+        if not cam_running:
             st.markdown(f"""
             <div class="camera_box">
-              <div class="camera_badge">WAITING FOR FEED</div>
-              <div style="font-size:48px">📡</div>
-              <div style="font-size:13px;color:{TEAL};">camera.py not running or frame not found</div>
-              <div style="font-size:11px;color:{TEAL};">Expected: <code>{FRAME_PATH}</code></div>
+              <div style="font-size:48px">⏳</div>
+              <div style="font-size:13px;color:{TEAL};">Model loading, please wait...</div>
             </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="border-radius:12px;overflow:hidden;background:#000;line-height:0;">
+              <img src="http://localhost:{MJPEG_PORT}/feed"
+                   style="width:100%;border-radius:12px;display:block;"
+                   onerror="this.style.display='none'">
+            </div>""", unsafe_allow_html=True)
+
+        # live detection chips below the frame
+        if detections:
+            chips = ""
+            for d in detections:
+                if d["being_used"]:
+                    cls, icon = "chip_in_use", "✅"
+                elif d["is_on"] and not d["being_used"]:
+                    cls, icon = "chip_wasting", "⚠"
+                else:
+                    cls, icon = "chip_off", "◉"
+                name = device_lookup(d["key"])
+                chips += f'<span class="detect_chip {cls}">{icon} {name}</span>'
+            st.markdown(f'<div style="margin-top:8px">{chips}</div>', unsafe_allow_html=True)
 
     with col_right:
         st.markdown('<div class="section_title">🚨 Status</div>', unsafe_allow_html=True)
 
-        if waste_active:
-            # get last wasted device from DB
-            last_dev = log_df.iloc[0]["Device"] if not log_df.empty else "DEVICE"
+        if not cam_running:
+            st.markdown(f"""
+            <div class="alert_box_safe">
+                <div class="alert_title_safe">⏳ Initialising</div>
+                <div class="alert_detail" style="text-align:center;color:{TEAL}">
+                    Loading YOLO model and connecting to camera...
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+        elif waste_active:
+            wasting_devs = [device_lookup(d["key"]) for d in detections
+                            if d["is_on"] and not d["being_used"]]
+            dev_list = ", ".join(wasting_devs) if wasting_devs else "DEVICE"
             st.markdown(f"""
             <div class="alert_box_waste">
                 <div class="alert_title_waste">🚨 Waste Detected!</div>
                 <div class="alert_detail">
-                    Room is <b style="color:{RED}">EMPTY</b> but device is ON<br>
-                    Last logged device: <b>{last_dev}</b><br>
+                    Room is <b style="color:{RED}">EMPTY</b> but device(s) are ON<br>
+                    <b>{dev_list}</b><br>
                     ⚡ Grid: <b>{CARBON_INTENSITY} gCO₂/kWh</b>
                 </div>
             </div>""", unsafe_allow_html=True)
@@ -380,46 +364,36 @@ with tab_live:
                 </div>
             </div>""", unsafe_allow_html=True)
 
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # ── recent detections from DB ────────────────────────────────────────
-        st.markdown('<div class="section_title">🔍 Recent Devices Seen</div>', unsafe_allow_html=True)
-        recent = query("""
-            SELECT device_id, MAX(date) as last_seen, SUM(total_time_wasted) as tw
-            FROM waste_logs
-            GROUP BY device_id
-            ORDER BY last_seen DESC
-            LIMIT 8
-        """)
-        if not recent.empty:
-            chips = ""
-            for _, row in recent.iterrows():
-                name  = device_lookup(row["device_id"])
-                waste = row["tw"]
-                cls   = "detect_item_waste" if waste > 30 else ""
-                chips += f'<span class="detect_item {cls}">{name}</span> '
-            st.markdown(f'<div style="margin-top:8px">{chips}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div style="font-size:12px;color:#999">No data yet.</div>', unsafe_allow_html=True)
+        # ── live session waste timers ──────────────────────────────────────
+        if total_waste_now:
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown('<div class="section_title">⏱ This Session</div>', unsafe_allow_html=True)
+            for key, secs in sorted(total_waste_now.items(), key=lambda x: -x[1]):
+                name = device_lookup(key)
+                st.markdown(
+                    f'<div style="font-size:12px;color:{NAVY};padding:4px 0;">'
+                    f'<b>{name}</b> — wasted <span style="color:{RED};font-weight:600">'
+                    f'{secs:.1f}s</span></div>',
+                    unsafe_allow_html=True
+                )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — INCIDENT LOG  (sortable)
-# ══════════════════════════════════════════════════════════════════════════════
+# ───────────────────────────────────────────────────────────────────────────
+# TAB 2 — INCIDENT LOG (sortable)
+# ───────────────────────────────────────────────────────────────────────────
 with tab_history:
     st.markdown('<div class="section_title">📋 Incident Log</div>', unsafe_allow_html=True)
 
+    log_df  = load_log()
     COLUMNS = ["Date", "Time", "Device", "Wasted (s)", "Energy (Wh)", "Carbon (g)", "Cost (Rs)"]
-    SORT_ARROWS = {"asc": "▲", "desc": "▼", "none": "⇅"}
+    ARROWS  = {"asc": "▲", "desc": "▼", "none": "⇅"}
 
-    # ── sort controls ────────────────────────────────────────────────────────
     sort_cols = st.columns(len(COLUMNS))
     for i, col_name in enumerate(COLUMNS):
         with sort_cols[i]:
             is_active = (st.session_state.sort_col == col_name)
-            arrow = (SORT_ARROWS["asc"] if st.session_state.sort_asc else SORT_ARROWS["desc"]) if is_active else SORT_ARROWS["none"]
-            label = f"{col_name} {arrow}"
-            if st.button(label, key=f"sort_{col_name}"):
+            arrow     = (ARROWS["asc"] if st.session_state.sort_asc else ARROWS["desc"]) if is_active else ARROWS["none"]
+            if st.button(f"{col_name} {arrow}", key=f"sort_{col_name}"):
                 if st.session_state.sort_col == col_name:
                     st.session_state.sort_asc = not st.session_state.sort_asc
                 else:
@@ -429,12 +403,9 @@ with tab_history:
 
     if not log_df.empty:
         display = log_df.copy()
-
-        # sort
-        col = st.session_state.sort_col
-        if col in display.columns:
-            sort_key = "_dt" if col in ("Date", "Time") else col
-            display = display.sort_values(sort_key, ascending=st.session_state.sort_asc)
+        col     = st.session_state.sort_col
+        sort_key = "_dt" if col in ("Date", "Time") else col
+        display  = display.sort_values(sort_key, ascending=st.session_state.sort_asc)
 
         rows_html = ""
         for _, row in display.iterrows():
@@ -450,73 +421,63 @@ with tab_history:
 
         st.markdown(f"""
         <table class="log_table">
-          <thead><tr>
-            {''.join(f'<th>{c}</th>' for c in COLUMNS)}
-          </tr></thead>
+          <thead><tr>{''.join(f'<th>{c}</th>' for c in COLUMNS)}</tr></thead>
           <tbody>{rows_html}</tbody>
         </table>""", unsafe_allow_html=True)
     else:
         st.markdown(
-            '<div class="empty_state">👀 No incidents yet — run camera.py to start logging...</div>',
+            '<div class="empty_state">👀 No incidents yet — waiting for first session to complete...</div>',
             unsafe_allow_html=True
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — ANALYTICS / GRAPHS
-# ══════════════════════════════════════════════════════════════════════════════
+# ───────────────────────────────────────────────────────────────────────────
+# TAB 3 — ANALYTICS
+# ───────────────────────────────────────────────────────────────────────────
 with tab_graphs:
     st.markdown('<div class="section_title">📊 Analytics</div>', unsafe_allow_html=True)
 
+    log_df = load_log()
+
     if log_df.empty:
         st.markdown(
-            '<div class="empty_state">📈 No data yet — run camera.py to populate the DB.</div>',
+            '<div class="empty_state">📈 No data yet — data appears after a session ends.</div>',
             unsafe_allow_html=True
         )
     else:
-        chart_df = log_df.copy().sort_values("_dt")
+        chart_df = log_df.sort_values("_dt")
 
-        # ── 1. Cumulative Carbon over time ─────────────────────────────────
+        # 1. Cumulative CO2
         st.markdown("##### Cumulative CO₂ Leaked Over Time")
         chart_df["Cumulative CO₂ (g)"] = chart_df["Carbon (g)"].cumsum()
-
         fig1 = go.Figure()
         fig1.add_trace(go.Scatter(
-            x=chart_df["_dt"],
-            y=chart_df["Cumulative CO₂ (g)"],
+            x=chart_df["_dt"], y=chart_df["Cumulative CO₂ (g)"],
             mode="lines+markers",
             line=dict(color=TEAL, width=2.5),
             marker=dict(color=NAVY, size=6, line=dict(color=WHITE, width=1.5)),
-            fill="tozeroy",
-            fillcolor="rgba(86,124,141,0.1)",
+            fill="tozeroy", fillcolor="rgba(86,124,141,0.1)",
         ))
         fig1.update_layout(
             paper_bgcolor=BEIGE, plot_bgcolor=WHITE,
             font=dict(color=NAVY, family="DM Sans"),
             margin=dict(l=40, r=20, t=20, b=40), height=260,
-            xaxis=dict(gridcolor=SKY, title="Time",           tickfont=dict(size=10, color=TEAL), linecolor=SKY),
-            yaxis=dict(gridcolor=SKY, title="Cumulative g CO₂", tickfont=dict(size=10, color=TEAL), linecolor=SKY),
+            xaxis=dict(gridcolor=SKY, title="Time",             tickfont=dict(size=10, color=TEAL)),
+            yaxis=dict(gridcolor=SKY, title="Cumulative g CO₂", tickfont=dict(size=10, color=TEAL)),
             showlegend=False,
         )
         st.plotly_chart(fig1, use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-
         g1, g2 = st.columns(2)
 
-        # ── 2. Wasted time by device ───────────────────────────────────────
+        # 2. Wasted time per device
         with g1:
             st.markdown("##### Wasted Time per Device")
-            by_dev = (
-                log_df.groupby("Device")["Wasted (s)"]
-                .sum()
-                .reset_index()
-                .sort_values("Wasted (s)", ascending=True)
-            )
+            by_dev = (log_df.groupby("Device")["Wasted (s)"].sum()
+                      .reset_index().sort_values("Wasted (s)", ascending=True))
             fig2 = go.Figure(go.Bar(
-                x=by_dev["Wasted (s)"],
-                y=by_dev["Device"],
-                orientation='h',
+                x=by_dev["Wasted (s)"], y=by_dev["Device"], orientation='h',
                 marker_color=TEAL,
                 text=by_dev["Wasted (s)"].apply(lambda v: f"{v:.1f}s"),
                 textposition="outside",
@@ -531,35 +492,27 @@ with tab_graphs:
             )
             st.plotly_chart(fig2, use_container_width=True)
 
-        # ── 3. Carbon share pie ────────────────────────────────────────────
+        # 3. CO2 share pie
         with g2:
             st.markdown("##### CO₂ Share by Device")
             by_co2 = log_df.groupby("Device")["Carbon (g)"].sum().reset_index()
             fig3 = go.Figure(go.Pie(
-                labels=by_co2["Device"],
-                values=by_co2["Carbon (g)"],
+                labels=by_co2["Device"], values=by_co2["Carbon (g)"],
                 hole=0.42,
                 marker=dict(colors=px.colors.sequential.Teal),
-                textinfo="label+percent",
-                textfont_size=11,
+                textinfo="label+percent", textfont_size=11,
             ))
             fig3.update_layout(
-                paper_bgcolor=BEIGE,
-                font=dict(color=NAVY, family="DM Sans"),
-                margin=dict(l=20, r=20, t=20, b=20), height=300,
-                showlegend=False,
+                paper_bgcolor=BEIGE, font=dict(color=NAVY, family="DM Sans"),
+                margin=dict(l=20, r=20, t=20, b=20), height=300, showlegend=False,
             )
             st.plotly_chart(fig3, use_container_width=True)
 
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # ── 4. Energy wasted per day bar ───────────────────────────────────
+        # 4. Daily energy wasted
         st.markdown("##### Daily Energy Wasted (Wh)")
         daily = log_df.groupby("Date")["Energy (Wh)"].sum().reset_index()
         fig4 = go.Figure(go.Bar(
-            x=daily["Date"],
-            y=daily["Energy (Wh)"],
-            marker_color=NAVY,
+            x=daily["Date"], y=daily["Energy (Wh)"], marker_color=NAVY,
             text=daily["Energy (Wh)"].apply(lambda v: f"{v:.3f} Wh"),
             textposition="outside",
         ))
@@ -567,23 +520,18 @@ with tab_graphs:
             paper_bgcolor=BEIGE, plot_bgcolor=WHITE,
             font=dict(color=NAVY, family="DM Sans"),
             margin=dict(l=40, r=20, t=20, b=60), height=280,
-            xaxis=dict(gridcolor=SKY, title="Date", tickfont=dict(size=10, color=TEAL), linecolor=SKY),
-            yaxis=dict(gridcolor=SKY, title="Energy (Wh)", tickfont=dict(size=10, color=TEAL), linecolor=SKY),
+            xaxis=dict(gridcolor=SKY, title="Date",        tickfont=dict(size=10, color=TEAL)),
+            yaxis=dict(gridcolor=SKY, title="Energy (Wh)", tickfont=dict(size=10, color=TEAL)),
             showlegend=False,
         )
         st.plotly_chart(fig4, use_container_width=True)
 
-        # ── 5. Cost per device ─────────────────────────────────────────────
+        # 5. Cost per device
         st.markdown("##### Cumulative Cost per Device (Rs)")
-        by_cost = (
-            log_df.groupby("Device")["Cost (Rs)"]
-            .sum()
-            .reset_index()
-            .sort_values("Cost (Rs)", ascending=False)
-        )
+        by_cost = (log_df.groupby("Device")["Cost (Rs)"].sum()
+                   .reset_index().sort_values("Cost (Rs)", ascending=False))
         fig5 = go.Figure(go.Bar(
-            x=by_cost["Device"],
-            y=by_cost["Cost (Rs)"],
+            x=by_cost["Device"], y=by_cost["Cost (Rs)"],
             marker_color=[TEAL if i % 2 == 0 else NAVY for i in range(len(by_cost))],
             text=by_cost["Cost (Rs)"].apply(lambda v: f"Rs {v:.4f}"),
             textposition="outside",
@@ -601,6 +549,6 @@ with tab_graphs:
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ── AUTO-REFRESH ─────────────────────────────────────────────────────────────
+# auto-refresh
 time.sleep(REFRESH_SECS)
 st.rerun()
