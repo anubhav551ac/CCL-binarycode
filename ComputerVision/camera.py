@@ -2,8 +2,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLOWorld
 import threading
-from datetime import datetime
 import time
+import requests
 
 class VideoStream:
     def __init__(self, src):
@@ -37,6 +37,13 @@ class VideoStream:
         self.stopped = True
         self.cap.release()  # let the frame fly into the vast void of the world of network
 
+def set_zoom(val):
+    def target():
+        try:
+            requests.get(f"http://192.168.137.54:8080/ptz?zoom={val}", timeout=0.2)
+        except:
+            pass
+    threading.Thread(target=target).start()
 
 def determine_state(roi, ambient_brightness):  # roi = region of interest
     if roi is None or roi.size == 0: return False, 0, 0
@@ -69,9 +76,10 @@ model.set_classes(custom_classes)
 dummy_frame = np.zeros((1280, 720, 3), dtype=np.uint8)
 model.predict(dummy_frame, device='cuda', verbose=False)
 last_seen = time.time()
+current_zoom = 0
 
 # ip camera stream
-url = 'http://192.168.1.72:8080/video'
+url = 'http://192.168.137.54:8080/video'
 vs = VideoStream(url).start()
 
 cv2.namedWindow("Vampire Power", cv2.WINDOW_NORMAL)
@@ -81,11 +89,12 @@ while True:
     frame = vs.read()
     if frame is None: continue
 
+    frame = cv2.resize(frame, (1280, 720))
+
     count_frame += 1
-    if count_frame % 60 != 0:
+    if count_frame % 15 != 0:
         continue
 
-    frame = cv2.resize(frame, (1280, 720))
     temp_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     ambient_brightness = np.mean(temp_gray)
 
@@ -143,8 +152,15 @@ while True:
     cv2.putText(frame, final_msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, alert_color, 3)
 
     cv2.imshow("Vampire Power", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    elif key == ord('=') or key == ord('r'):
+        current_zoom = min(current_zoom + 10, 100)
+        set_zoom(current_zoom)
+    elif key == ord('e'):
+        current_zoom = max(current_zoom - 10, 0)
+        set_zoom(current_zoom)
 
 vs.stop()
 cv2.destroyAllWindows()
