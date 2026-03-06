@@ -344,22 +344,18 @@ with tab_live:
               <div style="font-size:13px;color:{TEAL};">Model loading, please wait...</div>
             </div>""", unsafe_allow_html=True)
         else:
-            # Use JS to build the feed URL from the page's own hostname/IP,
-            # so remote clients (phones, etc.) resolve to the server, not localhost.
-            st.markdown(f"""
-            <div id="feedwrap" style="border-radius:12px;overflow:hidden;background:#000;line-height:0;min-height:200px;">
-              <img id="ghostfeed" src=""
+            import socket
+            try:
+                host_ip = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                host_ip = "localhost"
+            feed_url = f"http://{host_ip}:{MJPEG_PORT}/feed"
+            st.markdown(f'''
+            <div style="border-radius:12px;overflow:hidden;background:#000;line-height:0;">
+              <img src="{feed_url}"
                    style="width:100%;border-radius:12px;display:block;"
                    onerror="this.style.opacity='0.3'">
-            </div>
-            <script>
-              (function(){{
-                var img = document.getElementById('ghostfeed');
-                if(img){{
-                  img.src = window.location.protocol + '//' + window.location.hostname + ':{MJPEG_PORT}/feed';
-                }}
-              }})();
-            </script>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
 
         if detections:
             ref   = get_ref_table()
@@ -600,7 +596,7 @@ with tab_graphs:
             yaxis=dict(gridcolor=SKY, title="Cumulative g CO₂", tickfont=dict(size=10,color=TEAL)),
             showlegend=False,
         )
-        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig1, width='stretch')
 
         st.markdown("<br>", unsafe_allow_html=True)
         g1, g2 = st.columns(2)
@@ -623,7 +619,7 @@ with tab_graphs:
                 yaxis=dict(gridcolor=SKY, tickfont=dict(size=10,color=TEAL)),
                 showlegend=False,
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
         with g2:
             st.markdown("##### CO₂ Share by Device")
@@ -639,7 +635,7 @@ with tab_graphs:
                     paper_bgcolor=BEIGE, font=dict(color=NAVY,family="DM Sans"),
                     margin=dict(l=20,r=20,t=20,b=20), height=300, showlegend=False,
                 )
-                st.plotly_chart(fig3, use_container_width=True)
+                st.plotly_chart(fig3, width='stretch')
 
         st.markdown("##### Daily Wasted vs Used Energy (Wh)")
         daily_chart = load_daily()
@@ -660,7 +656,7 @@ with tab_graphs:
                 yaxis=dict(gridcolor=SKY, title="Wh", tickfont=dict(size=10,color=TEAL)),
                 legend=dict(bgcolor=BEIGE, font=dict(color=NAVY)),
             )
-            st.plotly_chart(fig4, use_container_width=True)
+            st.plotly_chart(fig4, width='stretch')
 
         st.markdown("##### Cumulative Cost per Device (Rs)")
         by_cost = (log_df.groupby("Device")["Cost (Rs)"].sum()
@@ -679,7 +675,7 @@ with tab_graphs:
             yaxis=dict(gridcolor=SKY, title="Rs", tickfont=dict(size=10,color=TEAL)),
             showlegend=False,
         )
-        st.plotly_chart(fig5, use_container_width=True)
+        st.plotly_chart(fig5, width='stretch')
 
 
 st.markdown("</div>", unsafe_allow_html=True)
