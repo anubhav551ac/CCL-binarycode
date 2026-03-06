@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from ultralytics import YOLOWorld
+from ultralytics import YOLOWorld, YOLOE
 import threading
 import time
 import requests
@@ -41,11 +41,26 @@ class VideoStream:
 def set_zoom(val):
     def target():
         try:
-            requests.get(f"http://192.168.137.54:8080/ptz?zoom={val}", timeout=0.2)
+            requests.get(f"http://192.168.137.244:8080/ptz?zoom={val}", timeout=0.2)
         except:
             pass
     threading.Thread(target=target).start()
 
+
+def get_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    if x1 >= x2 or y1 >= y2: return 0.0
+
+    intersection = (x2 - x1) * (y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+
+    return intersection / union
 
 def is_overlapping(box1, box2):
     x1 = max(box1[0], box2[0])
@@ -76,11 +91,11 @@ def determine_state(roi, ambient_brightness):  # roi = region of interest
     # print(f"Obj: {label} | Bright: {int(avg_brightness)} | Contrast: {int(contrast)}")  # remove later
     return score >= 2, avg_brightness, contrast
 
-model = YOLOWorld('yolov8s-world.pt').to('cuda')
+model = YOLOE('yoloe-26s-seg.pt').to('cuda')
 custom_classes = ["person", "laptop", "monitor", "television", "desk lamp",
                   "computer mouse", "keyboard", "power strip", "electric fan",
                   "air conditioner", "cell phone", "printer", "open window",
-                  "wall light", "screen with white border", "hand"]  # the objects
+                  "wall light", "flat rectangular tablet with white edges", "hand"]  # the objects
 nonelectronic_class = ["person", "open window", "hand"]
 model.set_classes(custom_classes)
 
@@ -131,7 +146,7 @@ total_waste = {}
 last_loop_time = time.time()
 
 # ip camera stream
-url = 'http://192.168.137.54:8080/video'
+url = 'http://192.168.137.244:8080/video'
 vs = VideoStream(url).start()
 
 cv2.namedWindow("Vampire Power", cv2.WINDOW_NORMAL)
@@ -141,24 +156,30 @@ while True:
     frame = vs.read()
     if frame is None: continue
 
+    current_time = time.time()
+
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
     elif key in [ord('='), ord('r')]:
-        current_zoom = min(current_zoom + 10, 100)
+        current_zoom = min(current_zoom + 10, 100);
         set_zoom(current_zoom)
     elif key == ord('e'):
-        current_zoom = max(current_zoom - 10, 0)
+        current_zoom = max(current_zoom - 10, 0);
         set_zoom(current_zoom)
 
     frame = cv2.resize(frame, (1920, 1080))
 
-    count_frame += 1
-    if count_frame % 15 != 0:
-        continue
+    # count_frame += 1
+    # if count_frame % 15 != 0:
+    #     continue
+
+    delta_time = current_time - last_loop_time
+    last_loop_time = current_time
 
     ambient_brightness = np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
     results = model.track(frame, conf=0.3, iou=0.5, device='cuda', persist=True, verbose=False)
+
     energy_waste_detected = False
     detected_people = []
     all_detections = []
@@ -174,18 +195,23 @@ while True:
 
             if label == "person":
                 detected_people.append(coords)
-                person_present = True
                 cv2.rectangle(frame, (coords[0], coords[1]), (coords[2], coords[3]), (0, 255, 0), 2)
-                cv2.putText(frame, f"PERSON ID:{track_id}", (coords[0], coords[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.putText(frame, f"PERSON ID:{track_id}", (coords[0], coords[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,(0, 255, 0), 2)
             else:
                 unique_key = f"{label}_{track_id}" if track_id != -1 else label
                 all_detections.append((unique_key, label, coords))
 
-        #check overlaps
-        current_time = time.time()
-        delta_time = current_time - last_loop_time
-        last_loop_time = current_time
+        filtered_detections = []
         for unique_key, label, coords in all_detections:
+            is_duplicate = False
+            for f_key, f_label, f_coords in filtered_detections:
+                if label == f_label and get_iou(coords, f_coords) > 0.7:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                filtered_detections.append((unique_key, label, coords))
+
+        for unique_key, label, coords in filtered_detections:
             if label in nonelectronic_class:
                 cv2.rectangle(frame, (coords[0], coords[1]), (coords[2], coords[3]), (255, 255, 255), 1)
                 cv2.putText(frame, label, (coords[0], coords[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),1)
@@ -200,16 +226,16 @@ while True:
                     device_timers[unique_key] = current_time
                     color, status_tag = (0, 255, 0), "IN USE"
                 else:
+                    # Increment total waste for this unique device
                     total_waste[unique_key] = total_waste.get(unique_key, 0) + delta_time
-                    wasted = total_waste[unique_key]
+
                     last_active = device_timers.get(unique_key, current_time)
                     time_unattended = current_time - last_active
 
                     if time_unattended < grace_period:
-                        # Flicker protection
                         color, status_tag = (0, 255, 0), "IN USE (STABILIZING)"
                     else:
-                        color, status_tag = (0, 0, 255), f"UNATTENDED {time_unattended:.1f}s"
+                        color, status_tag = (0, 0, 255), f"WASTED: {total_waste[unique_key]:.1f}s"
                         energy_waste_detected = True
             else:
                 color, status_tag = (100, 100, 100), "OFF"
@@ -229,7 +255,7 @@ for dev_id, total_sec in total_waste.items():
         row = cursor.fetchone()
         if row:
             power = row[0]
-            total_energy = power * (total_sec / 3600)
+            total_energy = power * (round(total_sec) / 3600)
             carbon = total_energy * 0.0004
             cursor.execute('INSERT INTO waste_logs (device_id, total_time_wasted, date, total_energy_wasted, carbon_footprint) VALUES (?, ?, ?, ?, ?)',
                            (dev_id, total_sec, session_date, total_energy, carbon))
@@ -237,7 +263,6 @@ for dev_id, total_sec in total_waste.items():
 
 conn.commit()
 conn.close()
-
 
 vs.stop()
 cv2.destroyAllWindows()
