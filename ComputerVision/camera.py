@@ -12,14 +12,15 @@ import time
 import requests
 import sqlite3
 import os
+from datetime import datetime, date
 from flask import Flask, Response
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-CAMERA_IP   = os.environ.get("GHOSTGRID_CAM_IP",   "192.168.1.72")
-CAMERA_PORT = os.environ.get("GHOSTGRID_CAM_PORT",  "8080")
+CAMERA_IP   = os.environ.get("GHOSTGRID_CAM_IP",        "192.168.1.72")
+CAMERA_PORT = os.environ.get("GHOSTGRID_CAM_PORT",       "8080")
 CAMERA_URL  = f"http://{CAMERA_IP}:{CAMERA_PORT}/video"
 PTZ_URL     = f"http://{CAMERA_IP}:{CAMERA_PORT}/ptz"
-DB_PATH     = os.environ.get("GHOSTGRID_DB",        "energy_data.db")
+DB_PATH     = os.environ.get("GHOSTGRID_DB",             "energy_data.db")
 MJPEG_PORT  = int(os.environ.get("GHOSTGRID_MJPEG_PORT", "5050"))
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -34,7 +35,7 @@ GRACE_PERIOD  = 5.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  HELPERS  (unchanged logic from original)
+#  HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 class VideoStream:
@@ -109,6 +110,13 @@ def determine_state(roi, ambient_brightness):
     return score >= 2, avg_brightness, contrast
 
 
+def _get_power(cursor, dev_id):
+    prefix = dev_id.rsplit('_', 1)[0] if '_' in dev_id else dev_id
+    cursor.execute('SELECT power_watts FROM devices WHERE device_type = ?', (prefix,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  DATABASE SETUP
 # ═══════════════════════════════════════════════════════════════════════════
@@ -129,9 +137,12 @@ def init_db(path=DB_PATH):
             ('computer mouse', 5), ('keyboard', 10), ('power strip', 5),
             ('electric fan', 50), ('air conditioner', 1000), ('cell phone', 10),
             ('printer', 100), ('wall light', 20), ('screen with white border', 50),
+            ('flat rectangular tablet with white edges', 50),
         ]
     )
 
+    # waste_logs: one row per device per "waste episode"
+    # (written every time a person re-enters, resetting the waste counter)
     cursor.execute('''CREATE TABLE IF NOT EXISTS waste_logs (
         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
         device_id           TEXT,
@@ -140,6 +151,19 @@ def init_db(path=DB_PATH):
         date                TEXT,
         total_energy_wasted REAL,
         carbon_footprint    REAL
+    )''')
+
+    # daily_summary: one row per device per calendar day
+    cursor.execute('''CREATE TABLE IF NOT EXISTS daily_summary (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        date                TEXT,
+        device_id           TEXT,
+        total_time_used     REAL,
+        total_time_wasted   REAL,
+        total_energy_used   REAL,
+        total_energy_wasted REAL,
+        carbon_footprint    REAL,
+        UNIQUE(date, device_id)
     )''')
 
     cursor.execute('''CREATE TABLE IF NOT EXISTS DeviceReferenceTable (
@@ -178,7 +202,6 @@ class CameraProcessor:
     """
     Spin up once via start().
     Read .latest_frame (BGR ndarray) and .state (dict) from any thread.
-    Call stop() then flush_to_db() to end the session.
     """
 
     def __init__(self, db_conn, camera_url=CAMERA_URL):
@@ -186,33 +209,53 @@ class CameraProcessor:
         self.camera_url = camera_url
         self._lock      = threading.Lock()
 
-        # shared live state — read by demo.py
+        # ── live state (read by demo.py) ──────────────────────────────────
         self.latest_frame = None
         self.state = {
             "running":        False,
             "person_present": False,
             "waste_active":   False,
-            "detections":     [],
+            # keyed by device prefix (e.g. "laptop"), value is latest dict
+            "detections":     {},
+            # cumulative waste per unique_key since last person-reset
+            "current_waste":  {},
+            # cumulative totals across the whole session (for display)
             "total_waste":    {},
             "total_usage":    {},
             "fps":            0.0,
         }
 
-        self._stopped       = False
-        self._vs            = None
-        self._model         = None
-        self._device_timers = {}
-        self._last_loop_t   = time.time()
-        self._fps_counter   = 0
-        self._fps_timer     = time.time()
+        self._stopped        = False
+        self._vs             = None
+        self._model          = None
+        self._device_timers  = {}
+        self._last_loop_t    = time.time()
+        self._fps_counter    = 0
+        self._fps_timer      = time.time()
+
+        # tracks whether person was present last frame (edge detection)
+        self._person_was_present = False
+
+        # daily summary flush — track last flush date
+        self._last_daily_date = date.today()
+        threading.Thread(target=self._daily_flush_watcher, daemon=True).start()
+
+    # ── public ───────────────────────────────────────────────────────────
 
     def start(self):
-        threading.Thread(target=self._init_and_run, daemon=True).start()
+        threading.Thread(target=self._init_and_run,      daemon=True).start()
         threading.Thread(target=self._start_mjpeg_server, daemon=True).start()
         return self
 
     def stop(self):
         self._stopped = True
+
+    def flush_final_to_db(self):
+        """Call on shutdown — writes any remaining waste and daily summary."""
+        self._flush_waste_to_db("shutdown")
+        self._flush_daily_summary()
+
+    # ── MJPEG server ──────────────────────────────────────────────────────
 
     def _start_mjpeg_server(self):
         app = Flask(__name__)
@@ -236,47 +279,122 @@ class CameraProcessor:
                             mimetype="multipart/x-mixed-replace; boundary=frame")
 
         import logging
-        log = logging.getLogger("werkzeug")
-        log.setLevel(logging.ERROR)
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
         app.run(host="0.0.0.0", port=MJPEG_PORT, threaded=True)
 
-    def flush_to_db(self):
+    # ── DB flush helpers ──────────────────────────────────────────────────
+
+    def _flush_waste_to_db(self, reason="person_returned"):
+        """
+        Write current waste window per device to waste_logs, then reset
+        current_waste counters. Called when a person is detected (re-entry)
+        or on shutdown.
+        """
         cursor       = self.db_conn.cursor()
-        session_date = time.ctime()
-        tw = self.state["total_waste"]
-        tu = self.state["total_usage"]
+        session_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        print("\n--- FINAL ENERGY & EFFICIENCY REPORT ---")
-        for dev_id in set(list(tw.keys()) + list(tu.keys())):
-            t_waste = tw.get(dev_id, 0)
-            t_usage = tu.get(dev_id, 0)
-            if (t_waste + t_usage) < 2.0:
+        with self._lock:
+            cw = dict(self.state["current_waste"])
+            tu = dict(self.state["total_usage"])
+
+        for dev_id, t_waste in cw.items():
+            if t_waste < 1.0:
+                continue
+            power = _get_power(cursor, dev_id)
+            if power is None:
                 continue
 
-            prefix = dev_id.rsplit('_', 1)[0] if '_' in dev_id else dev_id
-            cursor.execute('SELECT power_watts FROM devices WHERE device_type = ?', (prefix,))
-            row = cursor.fetchone()
-            if not row:
-                continue
-
-            power               = row[0]
-            total_energy_wasted = power * (round(t_waste) / 3600)
+            t_usage             = tu.get(dev_id, 0)
+            total_energy_wasted = power * (t_waste / 3600)
             carbon              = total_energy_wasted * 0.0004
 
             cursor.execute(
                 '''INSERT INTO waste_logs
-                   (device_id, total_time_wasted, total_time_used, date, total_energy_wasted, carbon_footprint)
+                   (device_id, total_time_wasted, total_time_used, date,
+                    total_energy_wasted, carbon_footprint)
                    VALUES (?, ?, ?, ?, ?, ?)''',
-                (dev_id, t_waste, t_usage, session_date, total_energy_wasted, carbon)
+                (dev_id, t_waste, t_usage, session_date,
+                 total_energy_wasted, carbon)
             )
-
-            eff = (t_usage / (t_usage + t_waste)) * 100 if (t_usage + t_waste) > 0 else 0
-            print(f"Device: {dev_id:20} | Used: {t_usage:6.1f}s | "
-                  f"Wasted: {t_waste:6.1f}s | Efficiency: {eff:.1f}%")
+            print(f"[camera] waste_log ← {dev_id}: {t_waste:.1f}s wasted ({reason})")
 
         self.db_conn.commit()
 
-    # ── internals ─────────────────────────────────────────────────────────
+        # reset the current-waste window; keep total_waste intact for display
+        with self._lock:
+            self.state["current_waste"] = {}
+
+    def _flush_daily_summary(self):
+        """
+        Upsert into daily_summary for today using session totals.
+        Uses INSERT OR REPLACE with accumulated values so multiple flushes
+        within a day keep adding up.
+        """
+        cursor    = self.db_conn.cursor()
+        today_str = date.today().isoformat()
+
+        with self._lock:
+            tw = dict(self.state["total_waste"])
+            tu = dict(self.state["total_usage"])
+
+        all_keys = set(list(tw.keys()) + list(tu.keys()))
+        for dev_id in all_keys:
+            t_waste = tw.get(dev_id, 0)
+            t_usage = tu.get(dev_id, 0)
+            if (t_waste + t_usage) < 1.0:
+                continue
+
+            power = _get_power(cursor, dev_id)
+            if power is None:
+                continue
+
+            energy_used   = power * (t_usage  / 3600)
+            energy_wasted = power * (t_waste  / 3600)
+            carbon        = (energy_used + energy_wasted) * 0.0004
+
+            # read existing row to accumulate correctly across multiple flushes
+            cursor.execute(
+                'SELECT total_time_used, total_time_wasted, total_energy_used, '
+                'total_energy_wasted, carbon_footprint '
+                'FROM daily_summary WHERE date=? AND device_id=?',
+                (today_str, dev_id)
+            )
+            existing = cursor.fetchone()
+            if existing:
+                # replace with fresh session totals (they already accumulate
+                # from t=0, so no need to add — just overwrite)
+                cursor.execute(
+                    '''INSERT OR REPLACE INTO daily_summary
+                       (date, device_id, total_time_used, total_time_wasted,
+                        total_energy_used, total_energy_wasted, carbon_footprint)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    (today_str, dev_id, t_usage, t_waste,
+                     energy_used, energy_wasted, carbon)
+                )
+            else:
+                cursor.execute(
+                    '''INSERT INTO daily_summary
+                       (date, device_id, total_time_used, total_time_wasted,
+                        total_energy_used, total_energy_wasted, carbon_footprint)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                    (today_str, dev_id, t_usage, t_waste,
+                     energy_used, energy_wasted, carbon)
+                )
+
+        self.db_conn.commit()
+        print(f"[camera] daily_summary flushed for {today_str}")
+
+    def _daily_flush_watcher(self):
+        """Background thread — flushes daily summary at midnight."""
+        while not self._stopped:
+            time.sleep(60)
+            today = date.today()
+            if today != self._last_daily_date:
+                print("[camera] New day — flushing daily summary")
+                self._flush_daily_summary()
+                self._last_daily_date = today
+
+    # ── init + run loop ───────────────────────────────────────────────────
 
     def _init_and_run(self):
         print("[camera] Loading YOLO model...")
@@ -317,6 +435,7 @@ class CameraProcessor:
             detected_people       = []
             all_detections        = []
             energy_waste_detected = False
+            live_detections       = {}
 
             if results and len(results[0].boxes) > 0:
                 ids = (results[0].boxes.id.cpu().numpy().astype(int)
@@ -338,6 +457,7 @@ class CameraProcessor:
                         unique_key = f"{label}_{track_id}" if track_id != -1 else label
                         all_detections.append((unique_key, label, coords))
 
+                # dedup
                 filtered = []
                 for unique_key, label, coords in all_detections:
                     is_dup = any(label == fl and get_iou(coords, fc) > 0.7
@@ -345,7 +465,9 @@ class CameraProcessor:
                     if not is_dup:
                         filtered.append((unique_key, label, coords))
 
-                live_detections = []
+                # ── detection per-device prefix (for "This Session" display) ──
+                # We collapse track IDs here so we show ONE entry per device type
+                live_detections = {}   # keyed by label prefix
 
                 for unique_key, label, coords in filtered:
                     if label in NONELECTRONIC:
@@ -369,6 +491,8 @@ class CameraProcessor:
                         else:
                             self.state["total_waste"][unique_key] = \
                                 self.state["total_waste"].get(unique_key, 0) + delta_time
+                            self.state["current_waste"][unique_key] = \
+                                self.state["current_waste"].get(unique_key, 0) + delta_time
                             last_active     = self._device_timers.get(unique_key, current_time)
                             time_unattended = current_time - last_active
                             if time_unattended < GRACE_PERIOD:
@@ -385,13 +509,34 @@ class CameraProcessor:
                                 (coords[0], coords[1] - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                    live_detections.append({
+                    # collapse to one entry per label for the UI
+                    # prefer the "worse" state: wasting > in use > off
+                    prev = live_detections.get(label)
+                    rank = {"IN USE": 1, "OFF": 0}
+                    def _rank(d):
+                        if d["is_on"] and not d["being_used"]: return 2
+                        if d["is_on"] and d["being_used"]:     return 1
+                        return 0
+                    entry = {
                         "key":        unique_key,
                         "label":      label,
                         "status":     status_tag,
                         "is_on":      is_on,
                         "being_used": being_used,
-                    })
+                    }
+                    if prev is None or _rank(entry) > _rank(prev):
+                        live_detections[label] = entry
+
+            # ── person re-entry edge: flush waste window to DB ──────────────
+            person_now = len(detected_people) > 0
+            if person_now and not self._person_was_present:
+                # rising edge — person just walked in
+                threading.Thread(
+                    target=self._flush_waste_to_db,
+                    args=("person_returned",),
+                    daemon=True
+                ).start()
+            self._person_was_present = person_now
 
             # FPS
             self._fps_counter += 1
@@ -403,11 +548,11 @@ class CameraProcessor:
                 fps = self.state.get("fps", 0.0)
 
             with self._lock:
-                self.latest_frame                = frame.copy()
-                self.state["person_present"]     = len(detected_people) > 0
-                self.state["waste_active"]       = energy_waste_detected
-                self.state["detections"]         = live_detections if results and len(results[0].boxes) > 0 else []
-                self.state["fps"]                = round(fps, 1)
+                self.latest_frame            = frame.copy()
+                self.state["person_present"] = person_now
+                self.state["waste_active"]   = energy_waste_detected
+                self.state["detections"]     = live_detections   # dict keyed by label
+                self.state["fps"]            = round(fps, 1)
 
         with self._lock:
             self.state["running"] = False
@@ -442,6 +587,6 @@ if __name__ == "__main__":
             cv2.imshow("Vampire Power", frame)
 
     processor.stop()
-    processor.flush_to_db()
+    processor.flush_final_to_db()
     db_conn.close()
     cv2.destroyAllWindows()
