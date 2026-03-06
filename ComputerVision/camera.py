@@ -45,6 +45,17 @@ def set_zoom(val):
             pass
     threading.Thread(target=target).start()
 
+
+def is_overlapping(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    if x1 < x2 and y1 < y2:
+        return True
+    return False
+
 def determine_state(roi, ambient_brightness):  # roi = region of interest
     if roi is None or roi.size == 0: return False, 0, 0
 
@@ -68,15 +79,19 @@ model = YOLOWorld('yolov8s-world.pt').to('cuda')
 custom_classes = ["person", "laptop", "monitor", "television", "desk lamp",
                   "computer mouse", "keyboard", "power strip", "electric fan",
                   "air conditioner", "cell phone", "printer", "open window",
-                  "wall light", "tablet"]  # the objects
-nonelectronic_class = ["person", "open window"]
+                  "wall light", "screen with white border", "hand"]  # the objects
+nonelectronic_class = ["person", "open window", "hand"]
 model.set_classes(custom_classes)
 
 # initialise
-dummy_frame = np.zeros((1280, 720, 3), dtype=np.uint8)
+dummy_frame = np.zeros((1920, 1080, 3), dtype=np.uint8)
 model.predict(dummy_frame, device='cuda', verbose=False)
 last_seen = time.time()
 current_zoom = 0
+device_timers = {}
+grace_period = 5.0
+total_waste = {}
+last_loop_time = time.time()
 
 # ip camera stream
 url = 'http://192.168.137.54:8080/video'
@@ -89,78 +104,97 @@ while True:
     frame = vs.read()
     if frame is None: continue
 
-    frame = cv2.resize(frame, (1280, 720))
-
-    count_frame += 1
-    if count_frame % 15 != 0:
-        continue
-
-    temp_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    ambient_brightness = np.mean(temp_gray)
-
-    # Use .predict instead of .track for more immediate detections
-    results = model.predict(frame, conf=0.3, iou=0.5, device='cuda', verbose=False)
-
-    person_present = False
-    energy_waste_detected = False
-
-    if results and len(results[0].boxes) > 0:
-        for box_data in results[0].boxes:
-            cls_id = int(box_data.cls[0])
-            conf = float(box_data.conf[0])
-
-            label = custom_classes[cls_id]
-            coords = box_data.xyxy[0].cpu().numpy().astype(int)
-
-            if label == "person":
-                person_present = True
-                cv2.rectangle(frame, (coords[0], coords[1]), (coords[2], coords[3]), (0, 255, 0), 2)
-                last_seen = time.time()
-                continue
-
-            roi = frame[coords[1]:coords[3], coords[0]:coords[2]]  # for non person objects
-            is_on, _, _ = determine_state(roi, ambient_brightness)
-
-            if is_on:
-                color = (0, 0, 255)
-            else:
-                color = (100, 100, 100)
-            if is_on:
-                status_tag = "ON"
-            else:
-                status_tag = "OFF"
-            if label in nonelectronic_class:
-                status_tag = "_"
-
-            cv2.rectangle(frame, (coords[0], coords[1]), (coords[2], coords[3]), color, 2)
-            cv2.putText(frame, f"{label} {status_tag}", (coords[0], coords[1] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-            if is_on:
-                energy_waste_detected = True
-
-    alert_color = (0, 255, 0)
-    final_msg = "SYSTEM NORMAL"
-
-    if energy_waste_detected and not person_present:
-        alert_color = (0, 0, 255)
-        final_msg = f"UNATTENDED WASTE FOR {time.time() - last_seen:.1f}s"
-    elif person_present:
-        final_msg = "OCCUPIED - ENERGY AUTHORIZED"
-
-    cv2.rectangle(frame, (0, 0), (1280, 60), (0, 0, 0), -1)
-    cv2.putText(frame, final_msg, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, alert_color, 3)
-
-    cv2.imshow("Vampire Power", frame)
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
-    elif key == ord('=') or key == ord('r'):
+    elif key in [ord('='), ord('r')]:
         current_zoom = min(current_zoom + 10, 100)
         set_zoom(current_zoom)
     elif key == ord('e'):
         current_zoom = max(current_zoom - 10, 0)
         set_zoom(current_zoom)
+
+    frame = cv2.resize(frame, (1920, 1080))
+
+    count_frame += 1
+    if count_frame % 15 != 0:
+        continue
+
+    ambient_brightness = np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+    results = model.track(frame, conf=0.3, iou=0.5, device='cuda', persist=True, verbose=False)
+    energy_waste_detected = False
+    detected_people = []
+    all_detections = []
+
+    if results and len(results[0].boxes) > 0:
+        ids = results[0].boxes.id.cpu().numpy().astype(int) if results[0].boxes.id is not None else [-1] * len(
+            results[0].boxes)
+
+        for box_data, track_id in zip(results[0].boxes, ids):
+            cls_id = int(box_data.cls[0])
+            label = custom_classes[cls_id]
+            coords = box_data.xyxy[0].cpu().numpy().astype(int)
+
+            if label == "person":
+                detected_people.append(coords)
+                person_present = True
+                cv2.rectangle(frame, (coords[0], coords[1]), (coords[2], coords[3]), (0, 255, 0), 2)
+                cv2.putText(frame, f"PERSON ID:{track_id}", (coords[0], coords[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            else:
+                unique_key = f"{label}_{track_id}" if track_id != -1 else label
+                all_detections.append((unique_key, label, coords))
+
+        #check overlaps
+        current_time = time.time()
+        delta_time = current_time - last_loop_time
+        last_loop_time = current_time
+        for unique_key, label, coords in all_detections:
+            if label in nonelectronic_class:
+                cv2.rectangle(frame, (coords[0], coords[1]), (coords[2], coords[3]), (255, 255, 255), 1)
+                cv2.putText(frame, label, (coords[0], coords[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255),1)
+                continue
+
+            roi = frame[coords[1]:coords[3], coords[0]:coords[2]]
+            is_on, _, _ = determine_state(roi, ambient_brightness)
+            being_used = any(is_overlapping(p, coords) for p in detected_people)
+
+            if is_on:
+                if being_used:
+                    device_timers[unique_key] = current_time
+                    color, status_tag = (0, 255, 0), "IN USE"
+                else:
+                    total_waste[unique_key] = total_waste.get(unique_key, 0) + delta_time
+                    wasted = total_waste[unique_key]
+                    last_active = device_timers.get(unique_key, current_time)
+                    time_unattended = current_time - last_active
+
+                    if time_unattended < grace_period:
+                        # Flicker protection
+                        color, status_tag = (0, 255, 0), "IN USE (STABILIZING)"
+                    else:
+                        color, status_tag = (0, 0, 255), f"UNATTENDED {time_unattended:.1f}s"
+                        energy_waste_detected = True
+            else:
+                color, status_tag = (100, 100, 100), "OFF"
+
+            cv2.rectangle(frame, (coords[0], coords[1]), (coords[2], coords[3]), color, 2)
+            cv2.putText(frame, f"{unique_key} {status_tag}", (coords[0], coords[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    last_annotated_frame = frame
+    cv2.imshow("Vampire Power", frame)
+
+print("\n--- FINAL ENERGY WASTE REPORT ---")
+with open("energy_waste_log.txt", "w") as f:
+    f.write(f"\nSession: {time.ctime()}\n")
+
+    logged_count = 0
+    for dev_id, total_sec in total_waste.items():
+        if total_sec >= 5.0:
+            line = f"Device: {dev_id} | Total Waste: {total_sec:.1f} seconds"
+            print(line)
+            f.write(line + "\n")
+            logged_count += 1
+    f.write("-" * 30 + "\n")
 
 vs.stop()
 cv2.destroyAllWindows()
