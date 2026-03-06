@@ -346,7 +346,12 @@ with tab_live:
         else:
             import socket
             try:
-                host_ip = socket.gethostbyname(socket.gethostname())
+                # Connect UDP to an external addr (doesn't actually send data)
+                # — forces OS to pick the correct outbound LAN interface IP
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                host_ip = s.getsockname()[0]
+                s.close()
             except Exception:
                 host_ip = "localhost"
             feed_url = f"http://{host_ip}:{MJPEG_PORT}/feed"
