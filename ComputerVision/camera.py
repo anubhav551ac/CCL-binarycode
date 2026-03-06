@@ -4,6 +4,7 @@ from ultralytics import YOLOWorld
 import threading
 import time
 import requests
+import sqlite3
 
 class VideoStream:
     def __init__(self, src):
@@ -83,7 +84,43 @@ custom_classes = ["person", "laptop", "monitor", "television", "desk lamp",
 nonelectronic_class = ["person", "open window", "hand"]
 model.set_classes(custom_classes)
 
-# initialise
+# Database setup
+conn = sqlite3.connect('energy_data.db')
+cursor = conn.cursor()
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS devices (
+    device_type TEXT PRIMARY KEY,
+    power_watts REAL
+)''')
+
+# Insert device power data
+devices_data = [
+    ('laptop', 100),
+    ('monitor', 50),
+    ('television', 150),
+    ('desk lamp', 20),
+    ('computer mouse', 5),
+    ('keyboard', 10),
+    ('power strip', 5),
+    ('electric fan', 50),
+    ('air conditioner', 1000),
+    ('cell phone', 10),
+    ('printer', 100),
+    ('wall light', 20),
+    ('screen with white border', 50),
+]
+
+cursor.executemany('INSERT OR IGNORE INTO devices (device_type, power_watts) VALUES (?, ?)', devices_data)
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS waste_logs (
+    device_id TEXT,
+    total_time_wasted REAL,
+    date TEXT,
+    total_energy_wasted REAL,
+    carbon_footprint REAL
+)''')
+
+conn.commit()
 dummy_frame = np.zeros((1920, 1080, 3), dtype=np.uint8)
 model.predict(dummy_frame, device='cuda', verbose=False)
 last_seen = time.time()
@@ -184,17 +221,23 @@ while True:
     cv2.imshow("Vampire Power", frame)
 
 print("\n--- FINAL ENERGY WASTE REPORT ---")
-with open("energy_waste_log.txt", "w") as f:
-    f.write(f"\nSession: {time.ctime()}\n")
+session_date = time.ctime()
+for dev_id, total_sec in total_waste.items():
+    if total_sec >= 5.0:
+        label = dev_id.split('_')[0] if '_' in dev_id else dev_id
+        cursor.execute('SELECT power_watts FROM devices WHERE device_type = ?', (label,))
+        row = cursor.fetchone()
+        if row:
+            power = row[0]
+            total_energy = power * (total_sec / 3600)
+            carbon = total_energy * 0.0004
+            cursor.execute('INSERT INTO waste_logs (device_id, total_time_wasted, date, total_energy_wasted, carbon_footprint) VALUES (?, ?, ?, ?, ?)',
+                           (dev_id, total_sec, session_date, total_energy, carbon))
+            print(f"Device: {dev_id} | Total Waste: {total_sec:.1f} seconds | Energy Wasted: {total_energy:.2f} Wh | Carbon Footprint: {carbon:.4f} kg CO2")
 
-    logged_count = 0
-    for dev_id, total_sec in total_waste.items():
-        if total_sec >= 5.0:
-            line = f"Device: {dev_id} | Total Waste: {total_sec:.1f} seconds"
-            print(line)
-            f.write(line + "\n")
-            logged_count += 1
-    f.write("-" * 30 + "\n")
+conn.commit()
+conn.close()
+
 
 vs.stop()
 cv2.destroyAllWindows()
