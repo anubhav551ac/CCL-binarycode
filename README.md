@@ -26,4 +26,4 @@ Nobody notices, Nobody Acts. Until now.
 Prithak Chhetri\
 Ritiz Raj Shakya\
 Sneha Khadka\
-Yamone Nar\
+Yamone Nar
