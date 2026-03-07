@@ -23,7 +23,7 @@ Nobody notices, Nobody Acts. Until now.
 * Integrating the program in cctv camera
 
 # OUR TEAM
-Prithak Chhetri
-Ritiz Raj Shakya
-Sneha Khadka
-Yamone Nar
+Prithak Chhetri\
+Ritiz Raj Shakya\
+Sneha Khadka\
+Yamone Nar\
