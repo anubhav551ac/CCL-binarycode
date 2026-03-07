@@ -21,3 +21,9 @@ Nobody notices, Nobody Acts. Until now.
 - Streamlit
 # Future vision
 * Integrating the program in cctv camera
+
+# OUR TEAM
+Prithak Chhetri
+Ritiz Raj Shakya
+Sneha Khadka
+Yamone Nar
