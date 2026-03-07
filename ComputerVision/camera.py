@@ -16,7 +16,7 @@ from datetime import datetime, date
 from flask import Flask, Response
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-CAMERA_IP   = os.environ.get("GHOSTGRID_CAM_IP",        "192.168.137.244")
+CAMERA_IP   = os.environ.get("GHOSTGRID_CAM_IP",        "192.168.137.205")
 CAMERA_PORT = os.environ.get("GHOSTGRID_CAM_PORT",       "8080")
 CAMERA_URL  = f"http://{CAMERA_IP}:{CAMERA_PORT}/video"
 PTZ_URL     = f"http://{CAMERA_IP}:{CAMERA_PORT}/ptz"
@@ -532,6 +532,16 @@ class CameraProcessor:
                                 color, status_tag = (0, 0, 255), \
                                     f"WASTED: {self.state['total_waste'][unique_key]:.1f}s"
                                 energy_waste_detected = True
+                                url = "https://api.pushover.net/1/messages.json"
+                                data = {
+                                    "token": 'ai62ez85469ho238mv1rf5mgg662pn',
+                                    "user": 'ug4i6e1oki9o4wrr4iq1nd7hhuxeye',
+                                    "message": f"Device is unattended",
+                                    "title": "GhostGrid Sentinel",
+                                    "priority": 1,   
+                                    "sound": "siren" 
+                                }
+                                response = requests.post(url, data=data)
                     else:
                         color, status_tag = (100, 100, 100), "OFF"
 
