@@ -93,6 +93,19 @@ st.markdown(f"""
   .empty_state {{ text-align:center; padding:32px; color:{TEAL}; font-size:13px; background:{WHITE}; border-radius:12px; border:1px dashed {SKY}; }}
   .row_divider {{ height:1px; background:{SKY}; margin:28px 0; }}
   [data-testid="column"] {{ padding:0 8px !important; }}
+
+  .stTabs [data-baseweb="tab"] {{color: #000000 !important; }}
+  .stTabs [data-selected="true"] {{color: #000000 !important; }}
+
+  .stTabs [data-testid="stVerticalBlock"] p {{color: #000000 !important; }}
+  .stTabs [data-testid="stVerticalBlock"] span {{color: #000000 !important; }}
+
+  .stMarkdown p {{ color: #000000 !importat; }}
+  .stMarkdown span {{ color: #000000 !important; }}
+
+  
+  
+
 </style>
 """, unsafe_allow_html=True)
 

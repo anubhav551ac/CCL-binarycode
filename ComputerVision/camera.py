@@ -107,7 +107,7 @@ def determine_state(roi, ambient_brightness):
     hsv            = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     avg_saturation = np.mean(hsv[:, :, 1])
 
-    is_bright        = avg_brightness > (ambient_brightness * 1.25)
+    is_bright        = avg_brightness > (ambient_brightness * 1.45)
     is_vibrant       = avg_saturation > 45
     is_high_contrast = contrast > 40
 
@@ -213,6 +213,7 @@ class CameraProcessor:
         self.db_conn    = db_conn
         self.camera_url = camera_url
         self._lock      = threading.Lock()
+        self.__playing = False
 
         # ── live state (read by demo.py) ──────────────────────────────────
         self.latest_frame = None
@@ -407,7 +408,7 @@ class CameraProcessor:
 
     def _init_and_run(self):
         print("[camera] Loading YOLO model...")
-        self._model = YOLOWorld('yolov8s-world.pt').to('cuda')
+        self._model = YOLOWorld('yolov8m-worldv2.pt').to('cuda')
         self._model.set_classes(CUSTOM_CLASSES)
         dummy = np.zeros((1080, 1920, 3), dtype=np.uint8)
         self._model.predict(dummy, device='cuda', verbose=False)
@@ -515,6 +516,7 @@ class CameraProcessor:
 
                     if is_on:
                         if being_used:
+                            self.__playing = False
                             self.state["total_usage"][unique_key] = \
                                 self.state["total_usage"].get(unique_key, 0) + delta_time
                             self._device_timers[unique_key] = current_time
@@ -532,16 +534,18 @@ class CameraProcessor:
                                 color, status_tag = (0, 0, 255), \
                                     f"WASTED: {self.state['total_waste'][unique_key]:.1f}s"
                                 energy_waste_detected = True
-                                url = "https://api.pushover.net/1/messages.json"
-                                data = {
-                                    "token": 'ai62ez85469ho238mv1rf5mgg662pn',
-                                    "user": 'ug4i6e1oki9o4wrr4iq1nd7hhuxeye',
-                                    "message": f"Device is unattended",
-                                    "title": "GhostGrid Sentinel",
-                                    "priority": 1,   
-                                    "sound": "siren" 
-                                }
-                                response = requests.post(url, data=data)
+                                if not self.__playing:
+                                    url = "https://api.pushover.net/1/messages.json"
+                                    data = {
+                                        "token": 'ai62ez85469ho238mv1rf5mgg662pn',
+                                        "user": 'ug4i6e1oki9o4wrr4iq1nd7hhuxeye',
+                                        "message": f"Device is unattended",
+                                        "title": "GhostGrid Sentinel",
+                                        "priority": 1,   
+                                        "sound": "hi" 
+                                    }
+                                    response = requests.post(url, data=data)
+                                    self.__playing = True
                     else:
                         color, status_tag = (100, 100, 100), "OFF"
 
